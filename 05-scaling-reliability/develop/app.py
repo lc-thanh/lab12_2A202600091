@@ -19,6 +19,7 @@ Simulate shutdown:
     # Xem agent log graceful shutdown message
 """
 import os
+import sys
 import time
 import signal
 import logging
@@ -27,6 +28,7 @@ from contextlib import asynccontextmanager
 
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 import uvicorn
 from utils.mock_llm import ask
 
@@ -35,17 +37,19 @@ logger = logging.getLogger(__name__)
 
 START_TIME = time.time()
 _is_ready = False
+_is_shutting_down = False
 _in_flight_requests = 0  # đếm số request đang xử lý
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _is_ready
+    global _is_ready, _is_shutting_down
 
     # ── Startup ──
     logger.info("Agent starting up...")
     logger.info("Loading model and checking dependencies...")
     time.sleep(0.2)  # simulate startup time
+    _is_shutting_down = False
     _is_ready = True
     logger.info("✅ Agent is ready!")
 
@@ -53,6 +57,7 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──
     _is_ready = False
+    _is_shutting_down = True
     logger.info("🔄 Graceful shutdown initiated...")
 
     # Chờ request đang xử lý hoàn thành (tối đa 30 giây)
@@ -73,6 +78,13 @@ app = FastAPI(title="Agent — Health Check Demo", lifespan=lifespan)
 async def track_requests(request, call_next):
     """Theo dõi số request đang xử lý."""
     global _in_flight_requests
+
+    if _is_shutting_down and request.url.path not in {"/health", "/ready"}:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Agent is shutting down"},
+        )
+
     _in_flight_requests += 1
     try:
         response = await call_next(request)
@@ -177,10 +189,43 @@ def handle_sigterm(signum, frame):
     SIGTERM là signal platform gửi khi muốn dừng container.
     Khác với SIGKILL (không thể catch được).
 
-    uvicorn bắt SIGTERM tự động và gọi lifespan shutdown.
-    Hàm này để log thêm thông tin.
+    Thực hiện các bước graceful shutdown cơ bản:
+    1. Stop accepting new requests
+    2. Finish current requests
+    3. Close connections
+    4. Exit
     """
-    logger.info(f"Received signal {signum} — uvicorn will handle graceful shutdown")
+    global _is_ready, _is_shutting_down
+
+    if _is_shutting_down:
+        logger.info("Shutdown already in progress")
+        return
+
+    logger.info(f"Received signal {signum} — initiating graceful shutdown")
+
+    # 1. Stop accepting new requests.
+    _is_ready = False
+    _is_shutting_down = True
+
+    # 2. Finish current requests (tối đa 30 giây).
+    timeout = 30
+    elapsed = 0
+    while _in_flight_requests > 0 and elapsed < timeout:
+        logger.info(f"Waiting for {_in_flight_requests} in-flight requests...")
+        time.sleep(1)
+        elapsed += 1
+
+    if _in_flight_requests > 0:
+        logger.warning(
+            f"Grace period expired with {_in_flight_requests} in-flight requests"
+        )
+
+    # 3. Close connections.
+    logger.info("Closing connections")
+
+    # 4. Exit.
+    logger.info("Shutdown complete")
+    sys.exit(0)
 
 
 signal.signal(signal.SIGTERM, handle_sigterm)

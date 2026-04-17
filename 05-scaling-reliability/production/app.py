@@ -17,15 +17,18 @@ Demo:
   python test_stateless.py
 """
 import os
+import sys
 import time
 import json
 import logging
 import uuid
+import signal
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -50,6 +53,9 @@ logger = logging.getLogger(__name__)
 
 START_TIME = time.time()
 INSTANCE_ID = os.getenv("INSTANCE_ID", f"instance-{uuid.uuid4().hex[:6]}")
+_is_ready = False
+_is_shutting_down = False
+_in_flight_requests = 0
 
 
 # ──────────────────────────────────────────────────────────
@@ -69,7 +75,11 @@ def load_session(session_id: str) -> dict:
     """Load session từ Redis."""
     if USE_REDIS:
         data = _redis.get(f"session:{session_id}")
-        return json.loads(data) if data else {}
+        if data is None:
+            return {}
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        return json.loads(str(data))
     return _memory_store.get(f"session:{session_id}", {})
 
 
@@ -92,10 +102,24 @@ def append_to_history(session_id: str, role: str, content: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _is_ready, _is_shutting_down
     logger.info(f"Starting instance {INSTANCE_ID}")
     logger.info(f"Storage: {'Redis ✅' if USE_REDIS else 'In-memory ⚠️'}")
+
+    _is_shutting_down = False
+    _is_ready = True
     yield
+
+    _is_ready = False
+    _is_shutting_down = True
     logger.info(f"Instance {INSTANCE_ID} shutting down")
+
+    timeout = 30
+    elapsed = 0
+    while _in_flight_requests > 0 and elapsed < timeout:
+        logger.info(f"Waiting for {_in_flight_requests} in-flight requests...")
+        time.sleep(1)
+        elapsed += 1
 
 
 app = FastAPI(
@@ -112,6 +136,21 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def track_requests(request, call_next):
+    global _in_flight_requests
+
+    if _is_shutting_down and request.url.path not in {"/health", "/ready"}:
+        return JSONResponse(status_code=503, content={"detail": "Instance is shutting down"})
+
+    _in_flight_requests += 1
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        _in_flight_requests -= 1
+
+
 # ──────────────────────────────────────────────────────────
 # Models
 # ──────────────────────────────────────────────────────────
@@ -119,6 +158,11 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     question: str
     session_id: str | None = None  # None = tạo session mới
+
+
+class AskRequest(BaseModel):
+    question: str
+    session_id: str | None = None
 
 
 # ──────────────────────────────────────────────────────────
@@ -154,6 +198,19 @@ async def chat(body: ChatRequest):
         "turn": len([m for m in history if m["role"] == "user"]) + 1,
         "served_by": INSTANCE_ID,  # ← thấy rõ bất kỳ instance nào cũng serve được
         "storage": "redis" if USE_REDIS else "in-memory",
+    }
+
+
+@app.post("/ask")
+async def ask_endpoint(body: AskRequest):
+    """Compatibility endpoint used in lab curl examples."""
+    result = await chat(ChatRequest(question=body.question, session_id=body.session_id))
+    return {
+        "question": result["question"],
+        "answer": result["answer"],
+        "session_id": result["session_id"],
+        "served_by": result["served_by"],
+        "storage": result["storage"],
     }
 
 
@@ -207,14 +264,42 @@ def health():
 
 @app.get("/ready")
 def ready():
+    if _is_shutting_down or not _is_ready:
+        raise HTTPException(503, "Instance not ready")
+
     if USE_REDIS:
         try:
             _redis.ping()
         except Exception:
             raise HTTPException(503, "Redis not available")
-    return {"ready": True, "instance": INSTANCE_ID}
+    return {"ready": True, "instance": INSTANCE_ID, "in_flight_requests": _in_flight_requests}
+
+
+def shutdown_handler(signum, frame):
+    global _is_ready, _is_shutting_down
+
+    if _is_shutting_down:
+        return
+
+    logger.info(f"Received signal {signum}, starting graceful shutdown")
+    _is_ready = False
+    _is_shutting_down = True
+
+    timeout = 30
+    elapsed = 0
+    while _in_flight_requests > 0 and elapsed < timeout:
+        logger.info(f"Waiting for {_in_flight_requests} in-flight requests before exit...")
+        time.sleep(1)
+        elapsed += 1
+
+    logger.info("Shutdown complete")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=port, timeout_graceful_shutdown=30)
