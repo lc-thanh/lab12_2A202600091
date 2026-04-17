@@ -35,8 +35,8 @@
 ## Part 3: Cloud Deployment
 
 ### Exercise 3.1: Railway deployment
-- URL: Chưa có URL public (chưa deploy thực tế trên Railway trong phiên này)
-- Screenshot: Chưa có, sẽ bổ sung sau khi deploy và chụp màn hình vào repo
+- URL: [lab12-production-b0a4.up.railway.app](https://lab12-production-b0a4.up.railway.app/)
+- Screenshot: [railway_app.png](/home/lc_thanh/ai/lab12_2A202600091/screenshot/railway_app.png), [railway_build_done.png](/home/lc_thanh/ai/lab12_2A202600091/screenshot/railway_build_done.png), [railway_build_log.png](/home/lc_thanh/ai/lab12_2A202600091/screenshot/railway_build_log.png), [railway_docs.png](/home/lc_thanh/ai/lab12_2A202600091/screenshot/railway_docs.png)
 
 ## Part 4: API Security
 
